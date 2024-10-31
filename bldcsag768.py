@@ -2,19 +2,15 @@ import torch
 import cv2
 import random
 import numpy as np
-import sys
 import matplotlib.pyplot as plt
-from tkinter import *
 from transformers import SamModel, SamProcessor
 from PIL import Image
 from diffusers import DDIMScheduler
 from diffusers import (
     StableDiffusionControlNetPipeline,
     ControlNetModel,
-    UNet2DConditionModel,
 )
 import torch.nn.functional as F
-from transformers import CLIPTokenizer, CLIPTextModel
 
 # CrossAttnStoreProcessor 클래스 정의 (SAG에 필요)
 class CrossAttnStoreProcessor:
@@ -23,17 +19,12 @@ class CrossAttnStoreProcessor:
         self.attention_probs = None
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None):
-        # 배치 크기와 시퀀스 길이 가져오기
-        batch_size, sequence_length, _ = hidden_states.shape
-        # 어텐션 마스크 준비
-        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         # Query 생성
         query = attn.to_q(hidden_states)
 
         # Encoder Hidden States 설정
-        if encoder_hidden_states is None:
-            encoder_hidden_states = hidden_states
-        elif attn.norm_cross:
+        encoder_hidden_states = encoder_hidden_states or hidden_states
+        if attn.norm_cross and encoder_hidden_states is not hidden_states:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
         # Key와 Value 생성
@@ -59,7 +50,7 @@ class CrossAttnStoreProcessor:
 
 # BlendedLatentDiffusionWithControlNet 클래스 정의
 class BLDCSAG768:
-    def __init__(self, prompt,negative_prompt, batch_size, blending_start_percentage, device):
+    def __init__(self, prompt, negative_prompt, blending_start_percentage, device):
         # 초기화: 입력된 파라미터들을 인스턴스 변수로 저장
         self.prompt = prompt
         self.negative_prompt = negative_prompt
@@ -67,7 +58,6 @@ class BLDCSAG768:
         self.mask = 'mask.png'
         self.model_path = 'stabilityai/stable-diffusion-2-1'
         self.controlnet_model_path = 'thibaud/controlnet-sd21-canny-diffusers'
-        self.batch_size = batch_size
         self.blending_start_percentage = blending_start_percentage
         self.device = device
         self.output_path = 'output.png'
@@ -75,31 +65,20 @@ class BLDCSAG768:
         self.load_models()
 
     def load_models(self):
-        # UNet 모델 로드
-        self.unet = UNet2DConditionModel.from_pretrained(
-            self.model_path,
-            subfolder="unet",
-            torch_dtype=torch.float16,
-            cross_attention_dim=1024  # cross_attention_dim 설정
-        ).to(self.device)
-
-        # ControlNet 모델 로드
-        self.controlnet = ControlNetModel.from_pretrained(
-            self.controlnet_model_path,
-            torch_dtype=torch.float16,
-            cross_attention_dim=1024  # cross_attention_dim 설정
-        ).to(self.device)
-
-        # Stable Diffusion 2.1 파이프라인 로드
+        # Stable Diffusion 2.1 파이프라인 로드 (UNet 및 ControlNet 포함)
         self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
             self.model_path,
-            unet=self.unet,
-            controlnet=self.controlnet,
+            controlnet=ControlNetModel.from_pretrained(
+                self.controlnet_model_path,
+                torch_dtype=torch.float16,
+                cross_attention_dim=1024
+            ),
             torch_dtype=torch.float16,
         ).to(self.device)
 
-        # VAE, 토크나이저, 텍스트 인코더, 스케줄러 로드
+        # VAE, UNet, 텍스트 인코더, 토크나이저, 스케줄러 로드
         self.vae = self.pipe.vae.to(self.device)
+        self.unet = self.pipe.unet
         self.tokenizer = self.pipe.tokenizer
         self.text_encoder = self.pipe.text_encoder.to(self.device)
         self.scheduler = DDIMScheduler.from_pretrained(self.model_path, subfolder="scheduler")
@@ -107,16 +86,11 @@ class BLDCSAG768:
     @torch.no_grad()
     def edit_image(
         self,
-        image_path,
-        mask_path,
-        prompts,
-        negative_prompts,
         height=768,
         width=768,
         num_inference_steps=100,
         guidance_scale=7.0,
         generator=None,
-        blending_percentage=0.10,
         sag_scale=0.8,  # SAG 스케일 추가
     ):
         # 랜덤 시드 설정
@@ -124,16 +98,17 @@ class BLDCSAG768:
             generator = torch.Generator(device=self.device)
             generator.manual_seed(random.randint(1, 2147483647))
 
-        # 1. 주어진 프롬프트의 개수를 기준으로 배치 크기 설정
-        batch_size = len(prompts)
+        # 배치 크기 설정 (고정값 1)
+        batch_size = 1
+        prompts = self.prompt
+        negative_prompts = self.negative_prompt
 
         # 2. 이미지 로드 및 리사이즈
-        image = Image.open(image_path)
-        image = image.resize((width, height), Image.BILINEAR)
-        image = np.array(image)[:, :, :3]
+        image = Image.open(self.init_image).convert("RGB").resize((width, height), Image.BILINEAR)
+        image_np = np.array(image)
 
         # 3. Canny Edge 이미지 생성
-        canny_image = self._create_canny_image(image)
+        canny_image = self._create_canny_image(image_np)
         Image.fromarray(canny_image).save('canny.png')
         controlnet_cond = self._prepare_control_image(canny_image)
 
@@ -141,28 +116,11 @@ class BLDCSAG768:
         source_latents = self._image2latent(image)
 
         # 5. 마스크 로드 및 처리
-        latent_mask, org_mask = self._read_mask(mask_path, dest_size=(height // 8, width // 8))
+        latent_mask = self._read_mask(self.mask, dest_size=(height // 8, width // 8))
 
         # 6. 텍스트 임베딩 생성
-        text_input = self.tokenizer(
-            prompts,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
-
-        # 네거티브 프롬프트 임베딩 생성
-        max_length = text_input.input_ids.shape[-1]
-        uncond_input = self.tokenizer(
-            negative_prompts,
-            padding="max_length",
-            max_length=max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+        text_embeddings = self._get_text_embeddings(prompts)
+        uncond_embeddings = self._get_text_embeddings(negative_prompts)
 
         # 초기 Latent 설정
         latents = torch.randn(
@@ -178,7 +136,6 @@ class BLDCSAG768:
 
         # 텐서 크기 맞추기
         source_latents = source_latents.repeat(batch_size, 1, 1, 1)
-        latent_mask = latent_mask.repeat(batch_size, 1, 1, 1)
         controlnet_cond = controlnet_cond.repeat(batch_size, 1, 1, 1).to(self.device).half()
 
         # SAG를 위한 변수 초기화
@@ -189,14 +146,19 @@ class BLDCSAG768:
         # 맵 사이즈를 얻기 위한 후크 함수
         def get_map_size(module, input, output):
             nonlocal map_size
-            map_size = output[0].shape[-2:]
+            if isinstance(output, tuple):
+                output_tensor = output[0]
+            else:
+                output_tensor = output
+            map_size = output_tensor.shape[-2:]
 
         # 어텐션 프로세서와 후크 등록
         self.unet.mid_block.attentions[0].transformer_blocks[0].attn1.processor = store_processor
         self.unet.mid_block.attentions[0].register_forward_hook(get_map_size)
 
-        # 타임스텝 루프 시작 (블렌딩 시작 시점 이후)
-        for t in timesteps[int(len(timesteps) * blending_percentage):]:
+        # 타임스텝 루프 시작
+        blending_start_step = int(len(timesteps) * self.blending_start_percentage)
+        for i, t in enumerate(timesteps):
             # Latent 모델 입력 스케일링
             latent_model_input = self.scheduler.scale_model_input(latents, t)
 
@@ -206,7 +168,7 @@ class BLDCSAG768:
             combined_embeddings = torch.cat([uncond_embeddings, text_embeddings], dim=0)
 
             # ControlNet 적용
-            controlnet_output = self.controlnet(
+            controlnet_output = self.pipe.controlnet(
                 latent_model_input,
                 t,
                 encoder_hidden_states=combined_embeddings,
@@ -248,7 +210,7 @@ class BLDCSAG768:
                 degraded_latent_model_input = self.scheduler.scale_model_input(degraded_latents, t)
 
                 # Degraded 입력에 대한 ControlNet 적용
-                degraded_controlnet_output = self.controlnet(
+                degraded_controlnet_output = self.pipe.controlnet(
                     degraded_latent_model_input,
                     t,
                     encoder_hidden_states=uncond_embeddings,
@@ -272,25 +234,8 @@ class BLDCSAG768:
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
 
             # 마스크와 블렌딩
-            noise_source_latents = self.scheduler.add_noise(
-                source_latents,
-                torch.randn(latents.shape, device=latents.device, generator=generator, dtype=latents.dtype),
-                t
-            )
-            kernel = np.ones((1, 1), np.uint8)
-
-            eroded_masks = torch.empty_like(latent_mask)
-
-            # 각 채널에 대해 침식 수행
-            for i in range(latent_mask.size(1)):
-                mask_np = latent_mask[0, i].cpu().numpy()
-                mask_np_uint8 = (mask_np * 255).astype(np.uint8)
-                eroded_np_uint8 = cv2.dilate(mask_np_uint8, kernel, iterations=1)
-                eroded_np = eroded_np_uint8.astype(np.float32) / 255.0
-                eroded_masks[0, i] = torch.from_numpy(eroded_np).to(latent_mask.dtype)
-
-            # Latents에 마스크 적용
-            latents = latents * eroded_masks + noise_source_latents * (1 - latent_mask)
+            if i >= blending_start_step:
+                latents = latents * latent_mask + source_latents * (1 - latent_mask)
 
         # 원래의 어텐션 프로세서로 복원
         self.unet.set_attn_processor(original_attn_processors)
@@ -311,9 +256,8 @@ class BLDCSAG768:
     @torch.no_grad()
     def _image2latent(self, image):
         # 이미지를 텐서로 변환하고 정규화
-        image = torch.from_numpy(image).float() / 127.5 - 1
-        image = image.permute(2, 0, 1).unsqueeze(0).to(self.device)
-        image = image.half()
+        image = np.array(image).astype(np.float32) / 127.5 - 1
+        image = torch.from_numpy(image.transpose(2, 0, 1)).unsqueeze(0).to(self.device).half()
         # VAE를 통해 Latent로 인코딩
         latents = self.vae.encode(image)["latent_dist"].mean
         latents = latents * 0.18215
@@ -322,21 +266,16 @@ class BLDCSAG768:
 
     def _read_mask(self, mask_path: str, dest_size=(96, 96)):
         # 마스크 이미지 로드 및 이진화
-        org_mask = Image.open(mask_path).convert("L")
-        mask = org_mask.resize(dest_size, Image.NEAREST)
-        mask = np.array(mask) / 255
-        mask[mask < 0.5] = 0
-        mask[mask >= 0.5] = 1
-        mask = mask[np.newaxis, np.newaxis, ...]
-        mask = torch.from_numpy(mask).half().to(self.device)
-
-        return mask, org_mask
+        mask = Image.open(mask_path).convert("L").resize(dest_size, Image.NEAREST)
+        mask = np.array(mask) / 255.0
+        mask = (mask >= 0.5).astype(np.float32)
+        mask = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).to(self.device).half()
+        return mask
 
     def _create_canny_image(self, image):
         # OpenCV를 사용하여 Canny Edge 이미지 생성
         gray_image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         edges = cv2.Canny(gray_image, 100, 200)
-        edges = cv2.resize(edges, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_LINEAR)
         return edges
 
     def _prepare_control_image(self, image):
@@ -352,10 +291,22 @@ class BLDCSAG768:
             image = torch.from_numpy(image).float()
         return image.to(self.device).half()
 
+    def _get_text_embeddings(self, text):
+        # 텍스트 임베딩 생성
+        text_input = self.tokenizer(
+            text,
+            padding="max_length",
+            max_length=self.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
+        return text_embeddings
+
     # pred_x0 함수 정의
     def pred_x0(self, sample, model_output, timestep):
         # 알파 및 베타 값 계산
-        alpha_prod_t = self.scheduler.alphas_cumprod[timestep].to(sample.device)
+        alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
         beta_prod_t = 1 - alpha_prod_t
         # 예측 타입에 따라 pred_original_sample 계산
         if self.scheduler.config.prediction_type == "epsilon":
@@ -371,7 +322,7 @@ class BLDCSAG768:
     # pred_epsilon 함수 정의
     def pred_epsilon(self, sample, model_output, timestep):
         # 알파 및 베타 값 계산
-        alpha_prod_t = self.scheduler.alphas_cumprod[timestep].to(sample.device)
+        alpha_prod_t = self.scheduler.alphas_cumprod[timestep]
         beta_prod_t = 1 - alpha_prod_t
         # 예측 타입에 따라 pred_eps 계산
         if self.scheduler.config.prediction_type == "epsilon":
@@ -397,7 +348,7 @@ class BLDCSAG768:
         attn_map = attn_map.reshape(b, h, hw1, hw2)
         attn_mask = attn_map.mean(1).sum(1) > 1.0
         attn_mask = attn_mask.reshape(b, map_size[0], map_size[1]).unsqueeze(1).repeat(1, latent_channel, 1, 1).type(attn_map.dtype)
-        attn_mask = F.interpolate(attn_mask, (latent_h, latent_w))
+        attn_mask = F.interpolate(attn_mask, (latent_h, latent_w), mode='nearest')
 
         # 블러 적용
         degraded_latents = self.gaussian_blur_2d(original_latents, kernel_size=9, sigma=1.0)
@@ -417,11 +368,11 @@ class BLDCSAG768:
         x_kernel = pdf / pdf.sum()
         x_kernel = x_kernel.to(device=img.device, dtype=img.dtype)
         kernel2d = torch.mm(x_kernel[:, None], x_kernel[None, :])
-        kernel2d = kernel2d.expand(img.shape[-3], 1, kernel2d.shape[0], kernel2d.shape[1])
-        padding = [kernel_size // 2] * 4
+        kernel2d = kernel2d.expand(img.shape[1], 1, kernel2d.shape[0], kernel2d.shape[1])
+        padding = kernel_size // 2
         # 이미지에 패딩 적용 및 컨볼루션
-        img = F.pad(img, padding, mode="reflect")
-        img = F.conv2d(img, kernel2d, groups=img.shape[-3])
+        img = F.pad(img, (padding, padding, padding, padding), mode="reflect")
+        img = F.conv2d(img, kernel2d, groups=img.shape[1])
         return img
 
 # SamImageProcessor 클래스 정의
@@ -436,11 +387,9 @@ class SamImageProcessor:
         self.pf_image = self._load_image()
         self.mask_num = mask_num % 3  # 마스크 번호 설정
 
-
     def _load_image(self):
         # 이미지 로드 및 리사이즈
         pf_image = Image.open(self.img_path).convert("RGB").resize((768, 768), Image.LANCZOS)
-        pf_image.save('original.png')
         return pf_image
 
     def process_image(self):
@@ -458,27 +407,22 @@ class SamImageProcessor:
         masks = self.processor.image_processor.post_process_masks(
             outputs.pred_masks.cpu(), inputs["original_sizes"].cpu(), inputs["reshaped_input_sizes"].cpu()
         )
-        scores = outputs.iou_scores
-        return masks, scores
+        return masks
 
-    def extract_max_score_mask(self, masks, scores):
+    def extract_max_score_mask(self, masks):
         # 최대 점수의 마스크 추출
         max_score_mask = masks[0][:, self.mask_num, :, :]
         return max_score_mask
 
     def save_mask_image(self, max_score_mask):
         # 마스크 이미지를 저장
-        color = np.array([0, 0, 0, 0.9])
-        h, w = max_score_mask.shape[-2:]
-        mask_image = np.where(max_score_mask.reshape(h, w, 1) != 0, color.reshape(1, 1, -1), [1, 1, 1, 1])
-        mask_image_pil = Image.fromarray((mask_image * 255).astype(np.uint8), 'RGBA')
+        mask_image = np.where(max_score_mask.numpy().reshape(768, 768, 1) != 0, [0, 0, 0, 255], [255, 255, 255, 0]).astype(np.uint8)
+        mask_image_pil = Image.fromarray(mask_image, 'RGBA')
         mask_image_pil.save('mask.png')
 
     def save_masked_image(self, max_score_mask):
         # 마스크된 이미지를 저장
-        max_score_mask_resized = max_score_mask.squeeze().numpy()
-        mask_resized = np.where(max_score_mask_resized != 0, 1, 0).astype(np.uint8)
-
+        mask_resized = max_score_mask.squeeze().numpy().astype(np.uint8)
         masked_image = np.array(self.pf_image) * mask_resized[:, :, np.newaxis]
 
         alpha_channel = (mask_resized * 255).astype(np.uint8)
@@ -490,20 +434,19 @@ class SamImageProcessor:
     def run(self):
         # 전체 프로세스 실행
         inputs, outputs = self.process_image()
-        masks, scores = self.post_process_masks(inputs, outputs)
-        max_score_mask = self.extract_max_score_mask(masks, scores)
+        masks = self.post_process_masks(inputs, outputs)
+        max_score_mask = self.extract_max_score_mask(masks)
         self.save_mask_image(max_score_mask)
         self.save_masked_image(max_score_mask)
 
 # ImageGridDisplay 클래스 정의
 class ImageGridDisplay:
-    def __init__(self, img1_path, img2_path, img3_path, img4_path, prompt):
-        # 이미지 경로 및 프롬프트 저장
+    def __init__(self, img1_path, img2_path, img3_path, img4_path):
+        # 이미지 경로 저장
         self.img1_path = img1_path
         self.img2_path = img2_path
         self.img3_path = img3_path
         self.img4_path = img4_path
-        self.prompt = prompt
         self.images = []
         # 이미지 로드 메서드 호출
         self.load_images()
